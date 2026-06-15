@@ -1,7 +1,2 @@
-import { } from 'game/utils';
-import { } from 'game/prototypes';
-import { } from 'game/constants';
-
-export function loop() {
-    // Your code goes here
-}
+// Change this path to run a different tutorial solution.
+export { loop } from './tutorial-final_test/main.mjs';

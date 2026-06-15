@@ -102,7 +102,6 @@ declare module "game/constants" {
 
     export const SPAWN_ENERGY_CAPACITY = 1000;
     export const SPAWN_HITS = 3000;
-    export const SPAWN_RANGE = 20;
 
     export const EFF_CONSTRUCTION_BOOST = 'eff_construction_boost';
     export const EFF_HEAL_BOOST = 'eff_heal_boost';
