@@ -1806,7 +1806,56 @@ function runEscortGuardRanger(ranger, context, roles) {
     }
 }
 
-function runBruiser(bruiser, context, roles) {
+function hostileCreepsIncludingEscort(context) {
+    return [
+        ...context.enemyCreeps,
+        ...(context.enemyEscort ? [context.enemyEscort] : []),
+    ];
+}
+
+function runBruiserAttack(bruiser, target) {
+    if (!target) {
+        return false;
+    }
+
+    if (bruiser.attack(target) === ERR_NOT_IN_RANGE) {
+        bruiser.moveTo(target);
+    }
+    return true;
+}
+
+function chooseUrgentBruiserTarget(bruiser, context) {
+    const enemies = hostileCreepsIncludingEscort(context);
+    const dangerousEnemies = enemies.filter(enemy => isDangerous(enemy));
+    const adjacentDanger = dangerousEnemies.filter(enemy => getRange(bruiser, enemy) <= 1);
+    if (adjacentDanger.length > 0) {
+        return findClosestByRange(bruiser, adjacentDanger);
+    }
+
+    const adjacentEnemies = enemies.filter(enemy => getRange(bruiser, enemy) <= 1);
+    if (adjacentEnemies.length > 0) {
+        return findClosestByRange(bruiser, adjacentEnemies);
+    }
+
+    const dangerNearBruiser = findInRange(bruiser, dangerousEnemies, 4);
+    if (dangerNearBruiser.length > 0) {
+        return findClosestByRange(bruiser, dangerNearBruiser);
+    }
+
+    if (state.phase !== PHASE_EMERGENCY_DEFENSE) {
+        return null;
+    }
+
+    const emergencyTargets = dangerousEnemies.filter(enemy =>
+        (context.myEscort && getRange(enemy, context.myEscort) <= 7) ||
+        (context.mySpawn && getRange(enemy, context.mySpawn) <= 7));
+
+    return emergencyTargets.length > 0
+        ? findClosestByRange(bruiser, emergencyTargets)
+        : null;
+}
+
+function healBruiserIfIdle(bruiser, context, roles) {
     const injuredFriendlies = [
         ...roles.rangers,
         ...roles.bruisers,
@@ -1824,43 +1873,34 @@ function runBruiser(bruiser, context, roles) {
     } else if (bruiser.hits < bruiser.hitsMax) {
         bruiser.heal(bruiser);
     }
+}
 
-    const adjacentEnemies = context.enemyCreeps.filter(enemy =>
-        getRange(bruiser, enemy) <= 1);
-    if (adjacentEnemies.length > 0) {
-        const target = findClosestByRange(bruiser, adjacentEnemies);
-        bruiser.attack(target);
+function runBruiser(bruiser, context, roles) {
+    const urgentTarget = chooseUrgentBruiserTarget(bruiser, context);
+    if (runBruiserAttack(bruiser, urgentTarget)) {
         return;
     }
 
     const escortTarget = enemyEscortPackageTarget(context, bruiser);
-    if (escortTarget) {
-        if (bruiser.attack(escortTarget) === ERR_NOT_IN_RANGE) {
-            bruiser.moveTo(escortTarget);
-        }
+    if (runBruiserAttack(bruiser, escortTarget)) {
         return;
     }
 
     const centerThreats = centerEnemies(context, CENTER_CLEAR_RANGE);
     if (centerThreats.length > 0) {
         const target = findClosestByRange(bruiser, centerThreats);
-        if (bruiser.attack(target) === ERR_NOT_IN_RANGE) {
-            bruiser.moveTo(target);
+        if (runBruiserAttack(bruiser, target)) {
+            return;
         }
-        return;
     }
 
     if (getRange(bruiser, CENTER_CHOKE) > CENTER_HOLD_RANGE) {
+        healBruiserIfIdle(bruiser, context, roles);
         bruiser.moveTo(CENTER_CHOKE);
         return;
     }
 
     if (state.centerControlTicks >= CENTER_CONTROL_TICKS_REQUIRED) {
-        if (getRange(bruiser, CENTER_CHOKE) > CENTER_PUSH_RANGE) {
-            bruiser.moveTo(CENTER_CHOKE);
-            return;
-        }
-
         const enemyWorkers = context.enemyCreeps.filter(creep =>
             hasBodyPart(creep, WORK) || hasBodyPart(creep, CARRY));
         const target = enemyWorkers.length > 0
@@ -1872,16 +1912,19 @@ function runBruiser(bruiser, context, roles) {
                 return;
             }
             if (target instanceof Source) {
+                healBruiserIfIdle(bruiser, context, roles);
                 if (getRange(bruiser, target) > 2) {
                     bruiser.moveTo(target);
                 }
                 return;
             }
-            if (bruiser.attack(target) === ERR_NOT_IN_RANGE) {
-                bruiser.moveTo(target);
+            if (runBruiserAttack(bruiser, target)) {
+                return;
             }
         }
     }
+
+    healBruiserIfIdle(bruiser, context, roles);
 }
 
 function runCenterSupportRanger(ranger, context, roles) {
