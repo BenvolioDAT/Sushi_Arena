@@ -69,10 +69,23 @@ const SAFE_HOLD_RANGE_FROM_SPAWN = 4;
 const FLAG_DANGER_RANGE = 7;
 const ROUTE_DANGER_RANGE = 4;
 const FLAG_CLEAR_TICKS_REQUIRED = 25;
-const MIN_WORKERS = 2;
+const MIN_WORKERS = 1;
 const MIN_RANGERS_BEFORE_ESCORT = 3;
 const MIN_HEALERS_BEFORE_ESCORT = 1;
 const MIN_TUGS_BEFORE_ESCORT = 1;
+const OPENING_ATTACK_TICKS = 350;
+const OPENING_FIRST_RANGERS = 1;
+const OPENING_PRESSURE_RANGERS = 2;
+const CENTER_CHOKE = { x: 50, y: 50 };
+const CENTER_HOLD_RANGE = 3;
+const CENTER_CLEAR_RANGE = 7;
+const CENTER_PUSH_RANGE = 14;
+const ENEMY_ESCORT_LOCK_RANGE = 9;
+const ENEMY_ESCORT_SUPPORT_RANGE = 1;
+const COMBAT_TARGET_LOCK_RANGE = 12;
+const OPENING_BRUISERS = 1;
+const OPENING_RANGERS = 1;
+const CENTER_CONTROL_TICKS_REQUIRED = 20;
 
 const DEBUG_LOG_INTERVAL = 50;
 const DEBUG_VISUALS = true;
@@ -105,8 +118,10 @@ const state = {
     },
     phase: PHASE_ECONOMY,
     flagClearTicks: 0,
+    centerControlTicks: 0,
     lastPhaseChangeTick: 0,
     enemyEnergyTargetId: null,
+    combatTargetIds: new Map(),
     stuck: new Map(),
     lastLogTick: -Infinity,
     lastRejectedRouteLog: -Infinity,
@@ -150,6 +165,11 @@ const BODY_PLANS = {
         [TOUGH, TOUGH, MOVE, MOVE, ATTACK, ATTACK],
         [TOUGH, MOVE, ATTACK],
         [MOVE, ATTACK],
+    ],
+    bruiser: [
+        [TOUGH, TOUGH, MOVE, MOVE, ATTACK, HEAL],
+        [TOUGH, MOVE, ATTACK, HEAL],
+        [MOVE, ATTACK, HEAL],
     ],
 };
 
@@ -243,6 +263,10 @@ function isMelee(creep) {
     return hasBodyPart(creep, ATTACK);
 }
 
+function isBruiser(creep) {
+    return hasBodyPart(creep, ATTACK) && hasBodyPart(creep, HEAL);
+}
+
 function isDangerous(creep) {
     return hasBodyPart(creep, ATTACK) || hasBodyPart(creep, RANGED_ATTACK);
 }
@@ -254,10 +278,15 @@ function classifyCreeps(creeps) {
         rangers: [],
         healers: [],
         melees: [],
+        bruisers: [],
         fighters: [],
     };
 
     for (const creep of creeps) {
+        if (isBruiser(creep)) {
+            roles.bruisers.push(creep);
+            roles.fighters.push(creep);
+        }
         if (isTug(creep)) {
             roles.tugs.push(creep);
         }
@@ -984,6 +1013,26 @@ function isFlagControlled(context, roles) {
     return flagDangerCount(context) === 0 && friendlyFightersNearFlag >= 1;
 }
 
+function centerEnemies(context, range = CENTER_CLEAR_RANGE) {
+    return context.enemyCreeps.filter(enemy =>
+        getRange(enemy, CENTER_CHOKE) <= range);
+}
+
+function centerDanger(context, range = CENTER_CLEAR_RANGE) {
+    return centerEnemies(context, range).filter(isDangerous);
+}
+
+function friendlyFightersNearCenter(roles, range = CENTER_CLEAR_RANGE) {
+    return roles.fighters.filter(fighter =>
+        getRange(fighter, CENTER_CHOKE) <= range);
+}
+
+function hasCenterControl(context, roles) {
+    const danger = centerDanger(context, CENTER_CLEAR_RANGE).length;
+    const friendlies = friendlyFightersNearCenter(roles, CENTER_CLEAR_RANGE).length;
+    return danger === 0 && friendlies >= 1;
+}
+
 function setPhase(phase, tick) {
     if (state.phase !== phase) {
         state.phase = phase;
@@ -1039,11 +1088,6 @@ function updatePhase(context, roles) {
     }
 
     const routeDanger = routeDangerCount(context, state.path.path, ROUTE_DANGER_RANGE);
-    const escortReady = roles.tugs.length >= MIN_TUGS_BEFORE_ESCORT &&
-        roles.rangers.length >= MIN_RANGERS_BEFORE_ESCORT &&
-        roles.healers.length >= MIN_HEALERS_BEFORE_ESCORT &&
-        state.flagClearTicks >= FLAG_CLEAR_TICKS_REQUIRED &&
-        routeDanger === 0;
 
     if (spawnDanger > 0 || escortDanger > 0) {
         setPhase(PHASE_EMERGENCY_DEFENSE, context.tick);
@@ -1056,8 +1100,42 @@ function updatePhase(context, roles) {
         return;
     }
 
+    if (hasCenterControl(context, roles)) {
+        state.centerControlTicks += 1;
+    } else {
+        state.centerControlTicks = 0;
+    }
+
+    const escortReady = roles.tugs.length >= MIN_TUGS_BEFORE_ESCORT &&
+        roles.rangers.length >= MIN_RANGERS_BEFORE_ESCORT &&
+        roles.healers.length >= MIN_HEALERS_BEFORE_ESCORT &&
+        state.flagClearTicks >= FLAG_CLEAR_TICKS_REQUIRED &&
+        state.centerControlTicks >= CENTER_CONTROL_TICKS_REQUIRED &&
+        routeDanger === 0;
+
+    const openingAttack = context.tick < OPENING_ATTACK_TICKS;
+    const earlyGame = context.tick < 600;
+    if (earlyGame && roles.bruisers.length < OPENING_BRUISERS) {
+        setPhase(PHASE_COMBAT, context.tick);
+        return;
+    }
+    if (earlyGame && state.centerControlTicks < CENTER_CONTROL_TICKS_REQUIRED) {
+        setPhase(PHASE_COMBAT, context.tick);
+        return;
+    }
+
+    if (openingAttack && roles.rangers.length < OPENING_FIRST_RANGERS) {
+        setPhase(PHASE_COMBAT, context.tick);
+        return;
+    }
+
     if (roles.workers.length < MIN_WORKERS) {
         setPhase(PHASE_ECONOMY, context.tick);
+        return;
+    }
+
+    if (openingAttack && roles.rangers.length < OPENING_PRESSURE_RANGERS) {
+        setPhase(PHASE_COMBAT, context.tick);
         return;
     }
 
@@ -1094,6 +1172,7 @@ function runSpawn(context, roles) {
     }
 
     const energy = getAvailableSpawnEnergy(spawn);
+    const openingAttack = context.tick < OPENING_ATTACK_TICKS;
     let body = null;
 
     if (state.phase === PHASE_EMERGENCY_DEFENSE) {
@@ -1113,12 +1192,16 @@ function runSpawn(context, roles) {
             body = chooseAffordableBody(BODY_PLANS.healer, energy);
         }
     } else if (state.phase === PHASE_COMBAT) {
-        if (roles.rangers.length < MIN_RANGERS_BEFORE_ESCORT) {
+        if (roles.bruisers.length < OPENING_BRUISERS) {
+            body = chooseAffordableBody(BODY_PLANS.bruiser, energy);
+        } else if (roles.rangers.length < OPENING_RANGERS) {
+            body = chooseAffordableBody(BODY_PLANS.ranger, energy);
+        } else if (roles.workers.length < MIN_WORKERS) {
+            body = chooseAffordableBody(BODY_PLANS.worker, energy);
+        } else if (roles.rangers.length < MIN_RANGERS_BEFORE_ESCORT) {
             body = chooseAffordableBody(BODY_PLANS.ranger, energy);
         } else if (roles.healers.length < MIN_HEALERS_BEFORE_ESCORT) {
             body = chooseAffordableBody(BODY_PLANS.healer, energy);
-        } else if (roles.rangers.length < MIN_RANGERS_BEFORE_ESCORT + 2) {
-            body = chooseAffordableBody(BODY_PLANS.ranger, energy);
         } else if (roles.tugs.length < MIN_TUGS_BEFORE_ESCORT) {
             body = chooseAffordableBody(BODY_PLANS.tug, energy);
         }
@@ -1151,12 +1234,20 @@ function runSpawn(context, roles) {
         body = chooseAffordableBody(BODY_PLANS.tug, energy);
     }
 
-    if (!body && roles.workers.length === 0) {
-        body = chooseAffordableBody(BODY_PLANS.worker, energy);
+    if (!body && roles.bruisers.length === 0) {
+        body = chooseAffordableBody(BODY_PLANS.bruiser, energy);
+    }
+
+    if (!body && openingAttack && roles.rangers.length === 0) {
+        body = chooseAffordableBody(BODY_PLANS.ranger, energy);
     }
 
     if (!body && roles.rangers.length === 0) {
         body = chooseAffordableBody(BODY_PLANS.ranger, energy);
+    }
+
+    if (!body && roles.workers.length === 0) {
+        body = chooseAffordableBody(BODY_PLANS.worker, energy);
     }
 
     if (!body &&
@@ -1420,24 +1511,105 @@ function runIdleTug(tug, context) {
     }
 }
 
+function isEscortPuller(creep, escort) {
+    if (!creep || !escort || getRange(creep, escort) > ENEMY_ESCORT_SUPPORT_RANGE) {
+        return false;
+    }
+
+    const moves = bodyPartCount(creep, MOVE);
+    const total = activeBodySize(creep);
+    const moveOnly = moves > 0 && moves === total;
+
+    return isTug(creep) || moveOnly;
+}
+
+function enemyEscortSupportCreeps(context) {
+    if (!context.enemyEscort) {
+        return [];
+    }
+
+    return context.enemyCreeps.filter(creep =>
+        isEscortPuller(creep, context.enemyEscort));
+}
+
+function rememberCombatTarget(unit, target) {
+    if (unit && target && target.id) {
+        state.combatTargetIds.set(unit.id, target.id);
+    }
+    return target;
+}
+
+function lockedCombatTarget(context, unit, maxRange = COMBAT_TARGET_LOCK_RANGE) {
+    const targetId = unit ? state.combatTargetIds.get(unit.id) : null;
+    if (!targetId) {
+        return null;
+    }
+
+    const target = getObjectById(targetId);
+    const validEnemy = target &&
+        target.exists &&
+        target.my === false &&
+        getRange(unit, target) <= maxRange &&
+        (
+            (context.enemyEscort && target.id === context.enemyEscort.id) ||
+            context.enemyCreeps.some(enemy => enemy.id === target.id)
+        );
+
+    if (validEnemy) {
+        return target;
+    }
+
+    state.combatTargetIds.delete(unit.id);
+    return null;
+}
+
+function enemyEscortPackageTarget(context, unit, maxRange = ENEMY_ESCORT_LOCK_RANGE) {
+    if (!context.enemyEscort || !unit) {
+        return null;
+    }
+
+    const supports = enemyEscortSupportCreeps(context);
+    const escortClose = getRange(unit, context.enemyEscort) <= maxRange;
+    const supportClose = supports.some(creep => getRange(unit, creep) <= maxRange);
+    const closeToScore = enemyEscortCloseToWinning(context);
+
+    if (!escortClose && !supportClose && !closeToScore) {
+        return null;
+    }
+
+    if (supports.length > 0) {
+        return rememberCombatTarget(unit, findClosestByRange(unit, supports));
+    }
+
+    return rememberCombatTarget(unit, context.enemyEscort);
+}
+
 function combatFocusTarget(context, unit) {
-    const escorts = context.enemyEscort ? [context.enemyEscort] : [];
+    const dangerousEnemies = context.enemyCreeps.filter(enemy => isDangerous(enemy));
     const dangerNearEscort = context.myEscort
-        ? findInRange(context.myEscort, context.enemyCreeps.filter(enemy => isDangerous(enemy)), 4)
+        ? findInRange(context.myEscort, dangerousEnemies, 4)
         : [];
-    const dangerNearUnit = findInRange(unit, context.enemyCreeps.filter(enemy => isDangerous(enemy)), 4);
 
     if (dangerNearEscort.length > 0) {
-        return findClosestByRange(unit, dangerNearEscort);
+        return rememberCombatTarget(unit, findClosestByRange(unit, dangerNearEscort));
     }
-    if (escorts.length > 0) {
-        return escorts[0];
+
+    const escortTarget = enemyEscortPackageTarget(context, unit);
+    if (escortTarget) {
+        return escortTarget;
     }
+
+    const lockedTarget = lockedCombatTarget(context, unit);
+    if (lockedTarget) {
+        return lockedTarget;
+    }
+
+    const dangerNearUnit = findInRange(unit, dangerousEnemies, 4);
     if (dangerNearUnit.length > 0) {
-        return findClosestByRange(unit, dangerNearUnit);
+        return rememberCombatTarget(unit, findClosestByRange(unit, dangerNearUnit));
     }
     if (context.enemyCreeps.length > 0) {
-        return findClosestByRange(unit, context.enemyCreeps);
+        return rememberCombatTarget(unit, findClosestByRange(unit, context.enemyCreeps));
     }
     return null;
 }
@@ -1530,15 +1702,16 @@ function runFlagControlRanger(ranger, context) {
         return;
     }
 
+    if (enemyEscortCloseToWinning(context)) {
+        const escortTarget = enemyEscortPackageTarget(context, ranger, MAP_SIZE);
+        rangedAttackAndKite(ranger, context, escortTarget || context.enemyEscort);
+        return;
+    }
+
     const enemyAtFlag = dangerousEnemiesNearPosition(context.enemyCreeps, flag, FLAG_DANGER_RANGE);
     const target = enemyAtFlag.length > 0 ? findClosestByRange(ranger, enemyAtFlag) : null;
     if (target) {
         rangedAttackAndKite(ranger, context, target);
-        return;
-    }
-
-    if (enemyEscortCloseToWinning(context)) {
-        rangedAttackAndKite(ranger, context, context.enemyEscort);
         return;
     }
 
@@ -1562,6 +1735,12 @@ function runSiegeRanger(ranger, context, roles) {
         if (retreat) {
             ranger.moveTo(retreat);
         }
+        return;
+    }
+
+    const escortTarget = enemyEscortPackageTarget(context, ranger);
+    if (escortTarget) {
+        rangedAttackAndKite(ranger, context, escortTarget);
         return;
     }
 
@@ -1627,6 +1806,157 @@ function runEscortGuardRanger(ranger, context, roles) {
     }
 }
 
+function runBruiser(bruiser, context, roles) {
+    const injuredFriendlies = [
+        ...roles.rangers,
+        ...roles.bruisers,
+        ...roles.workers,
+        ...(context.myEscort ? [context.myEscort] : []),
+    ].filter(creep =>
+        creep &&
+        creep.hits < creep.hitsMax &&
+        getRange(bruiser, creep) <= 1);
+
+    if (injuredFriendlies.length > 0) {
+        injuredFriendlies.sort((a, b) =>
+            (a.hits / a.hitsMax) - (b.hits / b.hitsMax));
+        bruiser.heal(injuredFriendlies[0]);
+    } else if (bruiser.hits < bruiser.hitsMax) {
+        bruiser.heal(bruiser);
+    }
+
+    const adjacentEnemies = context.enemyCreeps.filter(enemy =>
+        getRange(bruiser, enemy) <= 1);
+    if (adjacentEnemies.length > 0) {
+        const target = findClosestByRange(bruiser, adjacentEnemies);
+        bruiser.attack(target);
+        return;
+    }
+
+    const escortTarget = enemyEscortPackageTarget(context, bruiser);
+    if (escortTarget) {
+        if (bruiser.attack(escortTarget) === ERR_NOT_IN_RANGE) {
+            bruiser.moveTo(escortTarget);
+        }
+        return;
+    }
+
+    const centerThreats = centerEnemies(context, CENTER_CLEAR_RANGE);
+    if (centerThreats.length > 0) {
+        const target = findClosestByRange(bruiser, centerThreats);
+        if (bruiser.attack(target) === ERR_NOT_IN_RANGE) {
+            bruiser.moveTo(target);
+        }
+        return;
+    }
+
+    if (getRange(bruiser, CENTER_CHOKE) > CENTER_HOLD_RANGE) {
+        bruiser.moveTo(CENTER_CHOKE);
+        return;
+    }
+
+    if (state.centerControlTicks >= CENTER_CONTROL_TICKS_REQUIRED) {
+        if (getRange(bruiser, CENTER_CHOKE) > CENTER_PUSH_RANGE) {
+            bruiser.moveTo(CENTER_CHOKE);
+            return;
+        }
+
+        const enemyWorkers = context.enemyCreeps.filter(creep =>
+            hasBodyPart(creep, WORK) || hasBodyPart(creep, CARRY));
+        const target = enemyWorkers.length > 0
+            ? findClosestByRange(bruiser, enemyWorkers)
+            : chooseEnemyEnergyTarget(context);
+
+        if (target) {
+            if (context.enemySpawn && getRange(bruiser, context.enemySpawn) <= 5) {
+                return;
+            }
+            if (target instanceof Source) {
+                if (getRange(bruiser, target) > 2) {
+                    bruiser.moveTo(target);
+                }
+                return;
+            }
+            if (bruiser.attack(target) === ERR_NOT_IN_RANGE) {
+                bruiser.moveTo(target);
+            }
+        }
+    }
+}
+
+function runCenterSupportRanger(ranger, context, roles) {
+    const escortTarget = enemyEscortPackageTarget(context, ranger);
+    if (escortTarget) {
+        rangedAttackAndKite(ranger, context, escortTarget);
+        return;
+    }
+
+    const centerThreats = centerDanger(context, CENTER_CLEAR_RANGE);
+    if (centerThreats.length > 0) {
+        const target = findClosestByRange(ranger, centerThreats);
+        rangedAttackAndKite(ranger, context, target);
+        return;
+    }
+
+    const bruiser = roles.bruisers.length > 0
+        ? findClosestByRange(ranger, roles.bruisers)
+        : null;
+    if (bruiser && getRange(ranger, bruiser) > 3) {
+        ranger.moveTo(bruiser);
+        return;
+    }
+    if (!bruiser && getRange(ranger, CENTER_CHOKE) > 4) {
+        ranger.moveTo(CENTER_CHOKE);
+        return;
+    }
+
+    if (state.centerControlTicks >= CENTER_CONTROL_TICKS_REQUIRED) {
+        runSiegeRanger(ranger, context, roles);
+        return;
+    }
+
+    runFlagControlRanger(ranger, context);
+}
+
+function runOpeningPressureRanger(ranger, context, roles) {
+    if (context.targetFlag) {
+        const flagThreats = dangerousEnemiesNearPosition(
+            context.enemyCreeps,
+            context.targetFlag,
+            FLAG_DANGER_RANGE
+        );
+
+        if (flagThreats.length > 0) {
+            const target = findClosestByRange(ranger, flagThreats);
+            rangedAttackAndKite(ranger, context, target);
+            return;
+        }
+    }
+
+    const enemyWorkers = context.enemyCreeps.filter(creep =>
+        hasBodyPart(creep, WORK) || hasBodyPart(creep, CARRY));
+    if (enemyWorkers.length > 0) {
+        const target = findClosestByRange(ranger, enemyWorkers);
+        rangedAttackAndKite(ranger, context, target);
+        return;
+    }
+
+    const energyTarget = chooseEnemyEnergyTarget(context);
+    if (energyTarget) {
+        if (energyTarget instanceof Source || energyTarget instanceof StructureContainer) {
+            if (getRange(ranger, energyTarget) > 3) {
+                ranger.moveTo(energyTarget);
+            }
+            return;
+        }
+
+        rangedAttackAndKite(ranger, context, energyTarget);
+        return;
+    }
+
+    runFlagControlRanger(ranger, context);
+}
+
 function isPrimaryFlagRanger(ranger, context, roles) {
     if (!context.targetFlag || roles.rangers.length === 0) {
         return false;
@@ -1636,6 +1966,12 @@ function isPrimaryFlagRanger(ranger, context, roles) {
 }
 
 function runRanger(ranger, context, roles) {
+    const openingAttack = context.tick < OPENING_ATTACK_TICKS;
+    if (openingAttack && state.phase === PHASE_COMBAT) {
+        runCenterSupportRanger(ranger, context, roles);
+        return;
+    }
+
     if (state.phase === PHASE_EMERGENCY_DEFENSE) {
         runEmergencyRanger(ranger, context);
     } else if (state.phase === PHASE_SIEGE_ENERGY) {
@@ -1647,6 +1983,8 @@ function runRanger(ranger, context, roles) {
         }
     } else if (state.phase === PHASE_ESCORT) {
         runEscortGuardRanger(ranger, context, roles);
+    } else if (state.phase === PHASE_COMBAT) {
+        runCenterSupportRanger(ranger, context, roles);
     } else {
         runFlagControlRanger(ranger, context);
     }
@@ -1654,9 +1992,14 @@ function runRanger(ranger, context, roles) {
 
 function runMelee(melee, context) {
     let target = combatFocusTarget(context, melee);
-    if (state.phase === PHASE_COMBAT && context.targetFlag) {
-        const flagDanger = dangerousEnemiesNearPosition(context.enemyCreeps, context.targetFlag, FLAG_DANGER_RANGE);
-        target = flagDanger.length > 0 ? findClosestByRange(melee, flagDanger) : target;
+    if (state.phase === PHASE_COMBAT) {
+        const escortTarget = enemyEscortPackageTarget(context, melee);
+        if (escortTarget) {
+            target = escortTarget;
+        } else {
+            const centerThreats = centerEnemies(context, CENTER_CLEAR_RANGE);
+            target = centerThreats.length > 0 ? findClosestByRange(melee, centerThreats) : target;
+        }
     } else if (state.phase === PHASE_SIEGE_ENERGY) {
         const workers = context.enemyCreeps.filter(creep =>
             hasBodyPart(creep, WORK) || hasBodyPart(creep, CARRY));
@@ -1665,7 +2008,7 @@ function runMelee(melee, context) {
 
     if (!target) {
         const anchor = state.phase === PHASE_COMBAT
-            ? context.targetFlag
+            ? CENTER_CHOKE
             : context.myEscort || context.mySpawn;
         if (anchor && getRange(melee, anchor) > 2) {
             melee.moveTo(anchor);
@@ -1809,11 +2152,17 @@ function drawDebug(context, roles) {
 
     if (context.mySpawn) {
         visual.text(
-            `${state.phase} clear:${state.flagClearTicks} t:${roles.tugs.length} r:${roles.rangers.length}`,
+            `${state.phase} center:${state.centerControlTicks} flag:${state.flagClearTicks} b:${roles.bruisers.length} r:${roles.rangers.length}`,
             { x: context.mySpawn.x, y: context.mySpawn.y - 1 },
             { font: 0.6, color: '#ffffff', backgroundColor: '#202020', backgroundPadding: 0.15 }
         );
     }
+    visual.circle(CENTER_CHOKE, {
+        radius: CENTER_HOLD_RANGE,
+        stroke: '#ff9f1c',
+        fill: '#ff9f1c',
+        opacity: 0.08,
+    });
     if (context.targetFlag) {
         visual.circle(context.targetFlag, { radius: 0.55, stroke: '#00d084', fill: '#00d084', opacity: 0.15 });
         visual.circle(context.targetFlag, {
@@ -1849,9 +2198,9 @@ function logDebug(context, roles) {
     console.log(
         `[${arenaInfo.name}] tick=${context.tick} phase=${state.phase} route=${state.path.routeType} ` +
         `escortRange=${escortRange} enemyEscortRange=${enemyRange} ` +
-        `flagClear=${state.flagClearTicks} flagDanger=${flagDangerCount(context)} ` +
+        `center=${state.centerControlTicks} flagClear=${state.flagClearTicks} flagDanger=${flagDangerCount(context)} ` +
         `tugs=${roles.tugs.length} workers=${roles.workers.length} ` +
-        `healers=${roles.healers.length} rangers=${roles.rangers.length}`
+        `bruisers=${roles.bruisers.length} healers=${roles.healers.length} rangers=${roles.rangers.length}`
     );
 }
 
@@ -1879,8 +2228,11 @@ export function loop() {
     for (const worker of activeRoles.workers) {
         runWorker(worker, context, activeRoles);
     }
+    for (const bruiser of activeRoles.bruisers) {
+        runBruiser(bruiser, context, activeRoles);
+    }
     for (const healer of activeRoles.healers) {
-        if (!isRanger(healer) && !isMelee(healer)) {
+        if (!isRanger(healer) && !isMelee(healer) && !isBruiser(healer)) {
             runHealer(healer, context, activeRoles);
         }
     }
@@ -1888,7 +2240,7 @@ export function loop() {
         runRanger(ranger, context, activeRoles);
     }
     for (const melee of activeRoles.melees) {
-        if (!isRanger(melee)) {
+        if (!isRanger(melee) && !isBruiser(melee)) {
             runMelee(melee, context);
         }
     }
