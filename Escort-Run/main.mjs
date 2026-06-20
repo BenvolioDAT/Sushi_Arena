@@ -16,10 +16,13 @@ import {
     Creep,
     Flag,
     Source,
+    Structure,
     StructureContainer,
     StructureExtension,
+    StructureRampart,
     StructureRoad,
     StructureSpawn,
+    StructureWall,
 } from 'game/prototypes';
 import { Visual } from 'game/visual';
 import {
@@ -83,9 +86,12 @@ const state = {
         path: [],
         incomplete: true,
         generatedTick: -Infinity,
+        nextStep: null,
+        blockedTiles: 0,
     },
     stuck: new Map(),
     lastLogTick: -Infinity,
+    lastRejectedRouteLog: -Infinity,
     visual: null,
 };
 
@@ -270,20 +276,33 @@ function cachedObject(name) {
     return object && object.exists ? object : null;
 }
 
-function chooseTargetFlag(flags, mySpawn, enemySpawn) {
-    if (flags.length === 0 || !mySpawn) {
+function chooseTargetFlag(flags, mySpawn, enemySpawn, myEscort) {
+    if (!flags || flags.length === 0 || !mySpawn) {
         return null;
     }
 
-    let best = null;
-    let bestScore = -Infinity;
-    for (const flag of flags) {
-        const ownershipScore = flag.my === false ? 10000 : flag.my === undefined ? 8000 : 0;
-        const distanceFromHome = getRange(mySpawn, flag) * 20;
-        const enemySideScore = enemySpawn ? (MAP_MAX - getRange(enemySpawn, flag)) : 0;
-        const score = ownershipScore + distanceFromHome + enemySideScore;
+    // Escort Run marks our destination flag as ours when ownership is known.
+    // Never prefer enemy-owned flags for the escort destination.
+    const myFlag = flags.find(flag => flag.my === true);
+    if (myFlag) {
+        return myFlag;
+    }
 
-        if (score > bestScore) {
+    const nonEnemyFlags = flags.filter(flag => flag.my !== false);
+    const candidates = nonEnemyFlags.length > 0 ? nonEnemyFlags : flags;
+
+    // When ownership is missing, choose the far-side flag closest to our
+    // spawn/escort Y-lane on the mirrored Escort Run map.
+    const anchor = myEscort || mySpawn;
+    let best = null;
+    let bestScore = Infinity;
+
+    for (const flag of candidates) {
+        const horizontalDistance = Math.abs(flag.x - mySpawn.x);
+        const sameLanePenalty = Math.abs(flag.y - anchor.y) * 3;
+        const score = sameLanePenalty - horizontalDistance * 0.25;
+
+        if (score < bestScore) {
             best = flag;
             bestScore = score;
         }
@@ -323,6 +342,32 @@ function getEnemyEscort(creeps) {
     return getEscortCreeps(creeps).find(creep => creep.my === false);
 }
 
+function isStaticBlocker(object) {
+    if (!object || !object.exists) {
+        return false;
+    }
+
+    if (object instanceof StructureRoad || object instanceof StructureContainer) {
+        return false;
+    }
+
+    if (object instanceof StructureRampart) {
+        return object.my === false;
+    }
+
+    if (object instanceof StructureWall ||
+        object instanceof StructureSpawn ||
+        object instanceof StructureExtension) {
+        return true;
+    }
+
+    return object instanceof Structure;
+}
+
+function staticBlockerPositions() {
+    return getObjectsByPrototype(Structure).filter(isStaticBlocker);
+}
+
 function discoverObjects() {
     const spawns = getObjectsByPrototype(StructureSpawn);
     const cachedSpawn = cachedObject('spawn');
@@ -339,17 +384,22 @@ function discoverObjects() {
 
     const flags = getObjectsByPrototype(Flag);
     const cachedFlag = cachedObject('flag');
+    const ownedTargetFlag = flags.find(flag => flag.my === true);
     const targetFlag = cachedFlag &&
-        cachedFlag.my !== true &&
+        cachedFlag.my !== false &&
+        (!ownedTargetFlag || cachedFlag.id === ownedTargetFlag.id) &&
         flags.some(flag => flag.id === cachedFlag.id)
         ? cachedFlag
-        : chooseTargetFlag(flags, mySpawn, enemySpawn);
+        : chooseTargetFlag(flags, mySpawn, enemySpawn, myEscort);
 
     const myEscortId = myEscort ? myEscort.id : null;
     const enemyEscortId = enemyEscort ? enemyEscort.id : null;
     const myCreeps = allCreeps.filter(creep => creep.my && creep.id !== myEscortId);
     const activeMyCreeps = myCreeps.filter(creep => !creep.spawning);
     const enemyCreeps = allCreeps.filter(creep => creep.my === false && creep.id !== enemyEscortId);
+    const roads = getObjectsByPrototype(StructureRoad);
+    const containers = getObjectsByPrototype(StructureContainer);
+    const sites = getObjectsByPrototype(ConstructionSite);
 
     const context = {
         tick: getTicks(),
@@ -361,12 +411,14 @@ function discoverObjects() {
         targetFlag,
         flags,
         sources: getObjectsByPrototype(Source),
-        containers: getObjectsByPrototype(StructureContainer),
-        roads: getObjectsByPrototype(StructureRoad),
-        sites: getObjectsByPrototype(ConstructionSite),
+        containers,
+        roads,
+        sites,
+        allCreeps,
         myCreeps,
         activeMyCreeps,
         enemyCreeps,
+        staticBlockers: staticBlockerPositions(),
     };
 
     rememberId('spawn', mySpawn);
@@ -400,13 +452,57 @@ function terrainAt(pos) {
     return getTerrainAt(clampPosition(pos));
 }
 
-function isWalkable(pos) {
-    return pos &&
-        pos.x >= MAP_MIN &&
-        pos.x <= MAP_MAX &&
-        pos.y >= MAP_MIN &&
-        pos.y <= MAP_MAX &&
-        terrainAt(pos) !== TERRAIN_WALL;
+function idIsIgnored(object, ignoreIds) {
+    return object && ignoreIds.indexOf(object.id) >= 0;
+}
+
+function hasStaticBlockerAt(context, pos) {
+    return context.staticBlockers.some(blocker =>
+        blocker.x === pos.x && blocker.y === pos.y);
+}
+
+function hasCreepBlockerAt(context, pos, ignoreIds = []) {
+    const occupants = [
+        ...(context.allCreeps || []),
+        ...(context.myEscort ? [context.myEscort] : []),
+        ...(context.enemyEscort ? [context.enemyEscort] : []),
+    ];
+
+    return occupants.some(creep =>
+        creep &&
+        creep.exists &&
+        !creep.spawning &&
+        !idIsIgnored(creep, ignoreIds) &&
+        samePosition(creep, pos));
+}
+
+function isPassablePosition(context, pos, ignoreIds = []) {
+    if (!context || !pos) {
+        return false;
+    }
+    if (pos.x < MAP_MIN || pos.x > MAP_MAX || pos.y < MAP_MIN || pos.y > MAP_MAX) {
+        return false;
+    }
+    if (terrainAt(pos) === TERRAIN_WALL) {
+        return false;
+    }
+    if (hasStaticBlockerAt(context, pos)) {
+        return false;
+    }
+    if (hasCreepBlockerAt(context, pos, ignoreIds)) {
+        return false;
+    }
+    return true;
+}
+
+function stepToward(from, target) {
+    if (!from || !target) {
+        return null;
+    }
+    return {
+        x: from.x + clamp(target.x - from.x, -1, 1),
+        y: from.y + clamp(target.y - from.y, -1, 1),
+    };
 }
 
 function setMatrixCost(matrix, x, y, cost) {
@@ -452,8 +548,18 @@ function buildCostMatrix(context, origin, target, allowCentral) {
         }
     }
 
+    for (const blocker of context.staticBlockers) {
+        matrix.set(blocker.x, blocker.y, 255);
+    }
+
+    for (const creep of context.allCreeps) {
+        if (!samePosition(creep, origin)) {
+            matrix.set(creep.x, creep.y, 255);
+        }
+    }
+
     for (const road of context.roads) {
-        if (isWalkable(road)) {
+        if (isPassablePosition(context, road)) {
             matrix.set(road.x, road.y, 1);
         }
     }
@@ -478,9 +584,9 @@ function buildCostMatrix(context, origin, target, allowCentral) {
     return matrix;
 }
 
-function nearestWalkable(pos, maxRadius = 6) {
+function nearestWalkable(context, pos, maxRadius = 6) {
     const clamped = clampPosition(pos);
-    if (isWalkable(clamped)) {
+    if (isPassablePosition(context, clamped)) {
         return clamped;
     }
 
@@ -491,7 +597,7 @@ function nearestWalkable(pos, maxRadius = 6) {
                     continue;
                 }
                 const candidate = clampPosition({ x: clamped.x + dx, y: clamped.y + dy });
-                if (isWalkable(candidate)) {
+                if (isPassablePosition(context, candidate)) {
                     return candidate;
                 }
             }
@@ -501,11 +607,11 @@ function nearestWalkable(pos, maxRadius = 6) {
     return clamped;
 }
 
-function uniqueWaypoints(waypoints, origin, target) {
+function uniqueWaypoints(context, waypoints, origin, target) {
     const seen = new Set();
     const filtered = [];
     for (const waypoint of waypoints) {
-        const point = nearestWalkable(waypoint);
+        const point = nearestWalkable(context, waypoint);
         const key = positionKey(point);
         if (seen.has(key) || getRange(point, origin) <= 2 || getRange(point, target) <= 2) {
             continue;
@@ -516,25 +622,25 @@ function uniqueWaypoints(waypoints, origin, target) {
     return filtered;
 }
 
-function edgeWaypoints(origin, target, laneFraction) {
+function edgeWaypoints(context, origin, target, laneFraction) {
     const y = clamp(Math.round(MAP_MAX * laneFraction), MAP_MIN + 5, MAP_MAX - 5);
     const midX = Math.round((origin.x + target.x) / 2);
-    return uniqueWaypoints([
+    return uniqueWaypoints(context, [
         { x: origin.x, y },
         { x: midX, y },
         { x: target.x, y },
     ], origin, target);
 }
 
-function routeCandidates(origin, target) {
+function routeCandidates(context, origin, target) {
     return [
         { type: 'direct', waypoints: [], bias: 0 },
-        { type: 'lower-pass', waypoints: edgeWaypoints(origin, target, 0.84), bias: -120 },
-        { type: 'lower-pass-wide', waypoints: edgeWaypoints(origin, target, 0.91), bias: -90 },
-        { type: 'lower-pass-inner', waypoints: edgeWaypoints(origin, target, 0.74), bias: -60 },
-        { type: 'upper-pass', waypoints: edgeWaypoints(origin, target, 0.16), bias: -35 },
-        { type: 'upper-pass-wide', waypoints: edgeWaypoints(origin, target, 0.09), bias: -20 },
-        { type: 'upper-pass-inner', waypoints: edgeWaypoints(origin, target, 0.26), bias: -15 },
+        { type: 'lower-pass', waypoints: edgeWaypoints(context, origin, target, 0.84), bias: -35 },
+        { type: 'lower-pass-wide', waypoints: edgeWaypoints(context, origin, target, 0.91), bias: -25 },
+        { type: 'lower-pass-inner', waypoints: edgeWaypoints(context, origin, target, 0.74), bias: -18 },
+        { type: 'upper-pass', waypoints: edgeWaypoints(context, origin, target, 0.16), bias: -12 },
+        { type: 'upper-pass-wide', waypoints: edgeWaypoints(context, origin, target, 0.09), bias: -8 },
+        { type: 'upper-pass-inner', waypoints: edgeWaypoints(context, origin, target, 0.26), bias: -6 },
     ];
 }
 
@@ -549,13 +655,30 @@ function searchSegment(from, to, matrix, isFinal) {
     });
 }
 
-function searchCandidate(origin, target, matrix, candidate) {
+function pathBlockedTiles(context, path) {
+    return path.filter(step => !isPassablePosition(context, step));
+}
+
+function pathHasBlockedTile(context, path) {
+    return pathBlockedTiles(context, path).length > 0;
+}
+
+function maybeLogRejectedRoute(context, candidate, blockedCount) {
+    if (context.tick - state.lastRejectedRouteLog < DEBUG_LOG_INTERVAL) {
+        return;
+    }
+    state.lastRejectedRouteLog = context.tick;
+    console.log(`Rejected ${candidate.type} route: ${blockedCount} blocked path tiles`);
+}
+
+function searchCandidate(context, origin, target, matrix, candidate) {
     const stops = [...candidate.waypoints, target];
     let current = origin;
     let fullPath = [];
     let totalCost = candidate.bias;
     let totalOps = 0;
     let incomplete = false;
+    let blockedTiles = 0;
 
     for (let index = 0; index < stops.length; index += 1) {
         const stop = stops[index];
@@ -571,34 +694,49 @@ function searchCandidate(origin, target, matrix, candidate) {
         }
     }
 
+    blockedTiles = pathBlockedTiles(context, fullPath).length;
+    if (blockedTiles > 0) {
+        incomplete = true;
+        totalCost += 1000000;
+        maybeLogRejectedRoute(context, candidate, blockedTiles);
+    }
+
     return {
         routeType: candidate.type,
         path: fullPath,
         cost: totalCost + totalOps * 0.001 + (incomplete ? 100000 : 0),
         incomplete,
+        blockedTiles,
     };
 }
 
 function chooseRoute(context, origin, target) {
     const matrix = buildCostMatrix(context, origin, target, false);
-    let choices = routeCandidates(origin, target).map(candidate =>
-        searchCandidate(origin, target, matrix, candidate));
+    let choices = routeCandidates(context, origin, target).map(candidate =>
+        searchCandidate(context, origin, target, matrix, candidate));
 
     if (!choices.some(choice => !choice.incomplete && choice.path.length > 0)) {
         const fallbackMatrix = buildCostMatrix(context, origin, target, true);
-        choices = routeCandidates(origin, target).map(candidate =>
-            searchCandidate(origin, target, fallbackMatrix, candidate));
+        choices = routeCandidates(context, origin, target).map(candidate =>
+            searchCandidate(context, origin, target, fallbackMatrix, candidate));
     }
 
     choices.sort((a, b) => a.cost - b.cost);
-    return choices[0] || {
-        routeType: 'none',
+    const complete = choices.find(choice => !choice.incomplete && choice.path.length > 0);
+    if (complete) {
+        return complete;
+    }
+
+    const bestRejected = choices[0];
+    return {
+        routeType: bestRejected ? bestRejected.routeType : 'none',
         path: [],
         incomplete: true,
+        blockedTiles: bestRejected ? bestRejected.blockedTiles : 0,
     };
 }
 
-function pathIndexNear(creep, path) {
+function pathIndexNear(context, creep, path) {
     if (!path || path.length === 0) {
         return -1;
     }
@@ -612,7 +750,17 @@ function pathIndexNear(creep, path) {
     let bestIndex = -1;
     let bestScore = Infinity;
     for (let index = 0; index < path.length; index += 1) {
+        const candidate = path[index];
+        if (!isPassablePosition(context, candidate, [creep.id])) {
+            continue;
+        }
         const range = getRange(creep, path[index]);
+        if (range <= 1) {
+            const directStep = stepToward(creep, candidate);
+            if (!isPassablePosition(context, directStep, [creep.id])) {
+                continue;
+            }
+        }
         const score = range * 100 + index * 0.02;
         if (score < bestScore) {
             bestScore = score;
@@ -622,12 +770,12 @@ function pathIndexNear(creep, path) {
     return bestIndex;
 }
 
-function nextPathStep(creep, path) {
+function nextPathStep(context, creep, path) {
     if (!path || path.length === 0) {
         return null;
     }
 
-    const index = pathIndexNear(creep, path);
+    const index = pathIndexNear(context, creep, path);
     if (index < 0) {
         return path[0];
     }
@@ -639,28 +787,31 @@ function nextPathStep(creep, path) {
     return path[index];
 }
 
-function moveOneStep(creep, target) {
+function moveOneStep(context, creep, target) {
     if (!creep || !target || samePosition(creep, target)) {
         return OK;
     }
 
-    const dx = clamp(target.x - creep.x, -1, 1);
-    const dy = clamp(target.y - creep.y, -1, 1);
-    if (dx === 0 && dy === 0) {
+    const step = stepToward(creep, target);
+    if (!step || samePosition(step, creep)) {
         return OK;
     }
 
-    return creep.move(getDirection(dx, dy));
+    if (!isPassablePosition(context, step, [creep.id])) {
+        return ERR_NOT_IN_RANGE;
+    }
+
+    return creep.move(getDirection(step.x - creep.x, step.y - creep.y));
 }
 
-function moveAlongPath(creep, path) {
-    const next = nextPathStep(creep, path);
+function moveAlongPath(context, creep, path) {
+    const next = nextPathStep(context, creep, path);
     if (!next) {
         return ERR_NOT_IN_RANGE;
     }
 
     if (getRange(creep, next) <= 1) {
-        return moveOneStep(creep, next);
+        return moveOneStep(context, creep, next);
     }
 
     return creep.moveTo(next);
@@ -693,7 +844,11 @@ function routeIsBlocked(context, origin) {
         return true;
     }
 
-    const index = Math.max(0, pathIndexNear(origin, path));
+    if (pathHasBlockedTile(context, path)) {
+        return true;
+    }
+
+    const index = Math.max(0, pathIndexNear(context, origin, path));
     const danger = context.enemyCreeps.filter(enemy => isDangerous(enemy));
     if (context.enemyEscort) {
         danger.push(context.enemyEscort);
@@ -716,6 +871,8 @@ function ensureEscortRoute(context, origin, force = false) {
         state.path.path = [];
         state.path.routeType = 'none';
         state.path.incomplete = true;
+        state.path.nextStep = null;
+        state.path.blockedTiles = 0;
         return state.path;
     }
 
@@ -733,6 +890,8 @@ function ensureEscortRoute(context, origin, force = false) {
             path: route.path,
             incomplete: route.incomplete,
             generatedTick: context.tick,
+            nextStep: null,
+            blockedTiles: route.blockedTiles || 0,
         };
     }
 
@@ -843,17 +1002,17 @@ function existingRoadAt(context, pos) {
     return context.roads.some(road => samePosition(road, pos));
 }
 
-function workerNearRoute(worker) {
+function workerNearRoute(worker, context) {
     const path = state.path.path;
     if (!path || path.length === 0) {
         return false;
     }
-    const index = pathIndexNear(worker, path);
+    const index = pathIndexNear(context, worker, path);
     return index >= 0 && getRange(worker, path[index]) <= 1;
 }
 
 function maybeBuildRouteRoad(worker, context) {
-    if (!workerNearRoute(worker) ||
+    if (!workerNearRoute(worker, context) ||
         getUsedEnergy(worker) === 0 ||
         !context.mySpawn ||
         getFreeEnergyCapacity(context.mySpawn) > 0 ||
@@ -914,16 +1073,37 @@ function escortHealthRatio(escort) {
     return escort.hits / escort.hitsMax;
 }
 
+function canPullStep(context, tug, escort, next) {
+    if (!tug || !escort || !next) {
+        return false;
+    }
+    if (getRange(tug, escort) > 1 || getRange(tug, next) > 1) {
+        return false;
+    }
+    if (samePosition(next, tug) || samePosition(next, escort)) {
+        return false;
+    }
+    if (!isPassablePosition(context, next, [tug.id, escort.id])) {
+        return false;
+    }
+    if (!isPassablePosition(context, tug, [tug.id])) {
+        return false;
+    }
+    return true;
+}
+
 function runEscortPull(context, roles) {
     const escort = context.myEscort;
     const flag = context.targetFlag;
     const tug = roles.tugs.find(creep => !creep.spawning);
 
     if (!escort || !flag) {
+        state.path.nextStep = null;
         return;
     }
 
     if (!tug) {
+        state.path.nextStep = null;
         escort.moveTo(flag);
         return;
     }
@@ -945,27 +1125,37 @@ function runEscortPull(context, roles) {
     const healerNearby = roles.healers.some(healer => getRange(healer, escort) <= 3);
     const danger = hostileAttackersNearEscort(context, 3).length > 0;
     if (danger && healerNearby && escortHealthRatio(escort) < EMERGENCY_HEALTH_RATIO) {
-        tug.pull(escort);
         escort.moveTo(tug);
         return;
     }
 
     const route = ensureEscortRoute(context, tug, forceRepath);
-    const next = nextPathStep(tug, route.path);
+    let next = nextPathStep(context, tug, route.path);
     if (!next) {
-        tug.moveTo(flag);
+        ensureEscortRoute(context, tug, true);
+        next = nextPathStep(context, tug, state.path.path);
+        if (!canPullStep(context, tug, escort, next)) {
+            return;
+        }
+    }
+
+    if (!canPullStep(context, tug, escort, next)) {
+        const freshRoute = ensureEscortRoute(context, tug, true);
+        next = nextPathStep(context, tug, freshRoute.path);
+        if (!canPullStep(context, tug, escort, next)) {
+            return;
+        }
+    }
+
+    state.path.nextStep = next;
+    const moveResult = moveOneStep(context, tug, next);
+    if (moveResult === OK || moveResult === ERR_TIRED) {
         tug.pull(escort);
         escort.moveTo(tug);
         return;
     }
 
-    const moveResult = getRange(tug, next) <= 1 ? moveOneStep(tug, next) : moveAlongPath(tug, route.path);
-    tug.pull(escort);
-    escort.moveTo(tug);
-
-    if (moveResult !== OK && moveResult !== ERR_TIRED) {
-        ensureEscortRoute(context, tug, true);
-    }
+    ensureEscortRoute(context, tug, true);
 }
 
 function combatFocusTarget(context, unit) {
@@ -1003,7 +1193,7 @@ function shouldAssassinate(context, roles) {
     return roles.rangers.length >= ASSASSINATION_RANGER_COUNT;
 }
 
-function moveAwayFrom(creep, dangers) {
+function moveAwayFrom(context, creep, dangers) {
     if (dangers.length === 0) {
         return false;
     }
@@ -1020,8 +1210,8 @@ function moveAwayFrom(creep, dangers) {
         y: creep.y + clamp(dy, -1, 1),
     });
 
-    if (!samePosition(target, creep) && isWalkable(target)) {
-        moveOneStep(creep, target);
+    if (!samePosition(target, creep) && isPassablePosition(context, target, [creep.id])) {
+        moveOneStep(context, creep, target);
         return true;
     }
     return false;
@@ -1046,7 +1236,7 @@ function runRanger(ranger, context, roles) {
 
     const adjacentDanger = nearbyEnemies.filter(enemy =>
         getRange(ranger, enemy) <= 1 || (isDangerous(enemy) && getRange(ranger, enemy) <= 2));
-    if (adjacentDanger.length > 0 && moveAwayFrom(ranger, adjacentDanger)) {
+    if (adjacentDanger.length > 0 && moveAwayFrom(context, ranger, adjacentDanger)) {
         return;
     }
 
@@ -1055,7 +1245,7 @@ function runRanger(ranger, context, roles) {
         if (range > 3) {
             ranger.moveTo(target);
         } else if (range < 2) {
-            moveAwayFrom(ranger, [target]);
+            moveAwayFrom(context, ranger, [target]);
         }
         return;
     }
@@ -1153,6 +1343,24 @@ function drawDebug(context, roles) {
                 opacity: 0.35,
             });
         }
+
+        for (const blocked of pathBlockedTiles(context, state.path.path)) {
+            visual.circle(blocked, {
+                radius: 0.32,
+                stroke: '#ff3333',
+                fill: '#ff3333',
+                opacity: 0.55,
+            });
+        }
+    }
+
+    if (state.path.nextStep) {
+        visual.circle(state.path.nextStep, {
+            radius: 0.22,
+            stroke: '#ffffff',
+            fill: '#00d084',
+            opacity: 0.7,
+        });
     }
 
     if (context.mySpawn) {
